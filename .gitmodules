@@ -1,0 +1,3 @@
+[submodule "pufferlib/ocean/Showdown-Port"]
+	path = pufferlib/ocean/Showdown-Port
+	url = https://github.com/Vaibhav-Hariani/Showdown-Port
