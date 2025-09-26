@@ -419,6 +419,13 @@ class PuffeRL:
             # Learn on accumulated minibatches
             profile('learn', epoch)
             loss.backward()
+            if (loss != loss):
+                ##Ruh roh!
+                print("Loss is nan!")
+            else:
+                print("Nothing wrong!")
+                
+
             if (mb + 1) % self.accumulate_minibatches == 0:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
                 self.optimizer.step()
