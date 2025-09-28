@@ -135,6 +135,7 @@ MAKE_FUNCTIONS = {
     'drone_swarm': 'DroneSwarm',
     'nmmo3': 'NMMO3',
     'snake': 'Snake',
+    'showdown': 'Showdown',
     'squared': 'Squared',
     'pysquared': 'PySquared',
     'connect4': 'Connect4',
