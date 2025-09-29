@@ -159,6 +159,7 @@ class PuffeRL:
                 betas=(config['adam_beta1'], config['adam_beta2']),
                 eps=config['adam_eps'],
             )
+            # optimizer = optimizer.to(torch.float32)
         else:
             raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
 
