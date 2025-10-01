@@ -1020,9 +1020,9 @@ class Drone(nn.Module):
         return logits, values
 
 class ShowdownLSTM(pufferlib.models.LSTMWrapper):
-    def __init__(self, env, input_size = 108, hidden_size = 256, depth=12):
-        self.policy = Showdown(env, hidden_size=hidden_size)
-        super().__init__(env, self.policy, input_size, hidden_size)
+    def __init__(self, env, policy, input_size = 256, hidden_size = 256, depth=12):
+        # policy = Showdown(env, hidden_size=hidden_size, depth=depth)
+        super().__init__(env, policy, input_size, hidden_size)
 
 class Showdown(nn.Module):
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
@@ -1030,6 +1030,7 @@ class Showdown(nn.Module):
         super().__init__()
         # hidden_size = 256
         # depth = 6
+        self.is_continuous = False
         self.input_size = 108
         self.embed_size = 5
 
