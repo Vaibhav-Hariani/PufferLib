@@ -1028,18 +1028,20 @@ class Showdown(nn.Module):
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
     def __init__(self, env, hidden_size=256, depth=12):
         super().__init__()
-        # hidden_size = 256
-        # depth = 6
         self.is_continuous = False
-        self.input_size = 108
-        self.embed_size = 5
+        self.MAX_MOVE = 165.0
+        self.embed_size = 4  # Each pokemon row embedding output dim after summation
+        self.rows = 13
+        self.num_pokemon_rows = self.rows - 1  # exclude prev_action row
 
-        # 4 embedding vectors, 9 regular vectors per pokemon * 12 = 13 * 12 = 156
-        self.total_size = (self.embed_size + 9) * 12
+        # Per-pokemon feature assembly: embedding(4) + active/pps(5) + gamestate(4) = 13
+        self.per_row_feature_size = self.embed_size + 5 + 4  # =13
+        self.prev_action_size = 9  # raw prev_actions vector length
+
+        self.total_size = self.num_pokemon_rows * self.per_row_feature_size + self.prev_action_size  # 12*13 + 9 = 165
         # Max embedding is 165, for maximum move value.
         # 4d embedding dimension should be sufficient.
-        # self.embed = nn.Embedding(165, embedding_dim=4)
-        self.embed = nn.Identity(5)
+        self.embed = nn.Embedding(int(self.MAX_MOVE), embedding_dim=4)
         self.hidden_size = hidden_size
         self.num_actions = 10
 
@@ -1066,31 +1068,27 @@ class Showdown(nn.Module):
         return logits, values
 
     def encode_observations(self, observations: torch.Tensor, state=None):
-        mat = observations.view(-1, 12, 9)
+        mat = observations.view(-1, self.rows, 9)
 
-        # All of this can can be cached during inference
-        # embed_in = torch.zeros_like(mat[:, :, 0:5],dtype=float)
-        embed_in = (torch.abs(mat[:, :, 0:5]) & 0xFF).float()
-        # embed_in[:,:,0] = torch.abs(embed_in[:,:,0]) / 155
-        # embed_in[:,:,1:5] = embed_in[:,:,1:5] / 165
+        # Pokemon rows (exclude row 0 which is prev action)
+        pokemon_rows = mat[:, 1:, :]
 
-        embed_in = embed_in / 255
+        # Embedding inputs: lower byte of id + move ids (first 5 columns)
+        embed_in = (pokemon_rows[:, :, 1:5] & 0xFF).int()
+        embed_in[:, :, 0] = torch.abs(embed_in[:, :, 0])  # ensure positive id
+        embeddings = self.embed(embed_in).sum(dim=2)  # (B, num_pokemon_rows, embed_size)
 
-        embeddings = self.embed(embed_in[0:])
-        # embeddings = embeddings.sum(dim=2)
+        # Active flags + PP info live in high bits of first 5 ints
+        active_and_pps = ((pokemon_rows[:, :, 0:5] & ~0xFF) >> 8) / 255.0  # (B, num_pokemon_rows, 5)
+        # Remaining game state columns (hp, status, stat mods, etc.)
+        gamestate = pokemon_rows[:, :, 5:] / 800.0  # (B, num_pokemon_rows, 4)
 
-        # Also encoding active pokemon here
-        active_and_pps = ((mat[:, :, 0:5] & ~0xFF) >> 8) / 255
-        gamestate = (mat[:, :, 5:]) / 800
-        # Dimensions should be batch x (48 + 9 * 12) = 156
-        combined_input = torch.cat(
-            [embeddings, active_and_pps, gamestate], dim=2
-        ).flatten(start_dim=1)
-        if(combined_input.max() > 1 or combined_input.min() < -1):
-            print("Warning: combined input out of range", combined_input.max(), combined_input.min())
-        out =  self.encoder.forward(combined_input)
-        if(out.isnan().any()):
-            pass
+        per_pokemon_features = torch.cat([embeddings, active_and_pps, gamestate], dim=2).flatten(start_dim=1)
+        prev_actions = mat[:, 0, :].float()
+        prev_actions = prev_actions / self.MAX_MOVE  # scale down to small range
+        combined_input = torch.cat([prev_actions, per_pokemon_features], dim=1)
+
+        out = self.encoder(combined_input)
         return out
 
     def decode_actions(self, hidden: torch.Tensor):
