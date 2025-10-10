@@ -18,8 +18,6 @@ Recurrent = pufferlib.models.LSTMWrapper
 from pufferlib.pytorch import layer_init, _nativize_dtype, nativize_tensor
 import numpy as np
 
-from pufferlib.ocean.showdown.py_print import ShowdownParser
-
 class Boids(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
         super().__init__()
@@ -1044,7 +1042,8 @@ class Showdown(nn.Module):
         self.move_embed = nn.Embedding(int(self.MAX_MOVE), 4)  # Max move id ~165
         self.hidden_size = hidden_size
         self.num_actions = 10
-        self.input_size = 138  # Updated to match unpack_obs output
+        
+        self.input_size = 198  # Unpacked feature size
 
         encoder_layers = [nn.Linear(self.input_size, hidden_size), nn.GELU()]
         for i in range(depth):
@@ -1084,58 +1083,47 @@ class Showdown(nn.Module):
         # Header: 8 ints - choices (0-3) + stat mods (4-7)
         header = obs[:, :8]
         # Choices: p1_choice, p1_val, p2_choice, p2_val (normalized 0-1)
-        p1_choice = header[:, 0].float() / 2
-        p1_val = header[:, 1].float() / Showdown.MAX_MOVE
-        p2_choice = header[:, 2].float() / 2
-        p2_val = header[:, 3].float() / Showdown.MAX_MOVE
+        p1_choice = obs[:, 0:1] / 2.0
+        p1_val = obs[:, 1:2] / Showdown.MAX_MOVE
+        p2_choice = obs[:, 2:3] / 2.0
+        p2_val = obs[:, 3:4] / Showdown.MAX_MOVE
         # Stat mods: unpack and normalize for both players
-        p1_stats = self.unpack_stats(header[:, 4], header[:, 5])  # [batch, 7]
-        p2_stats = self.unpack_stats(header[:, 6], header[:, 7])  # [batch, 7]
+        p1_stats = self.unpack_stats(obs[:, 4:5], obs[:, 5:6])  # [batch, 7]
+        p2_stats = self.unpack_stats(obs[:, 6:7], obs[:, 7:8])  # [batch, 7]
         
         # Flatten into single vector: choices + p1_stats + p2_stats
         active_features = torch.cat([p1_choice, p1_val, p2_choice, p2_val, p1_stats, p2_stats], dim=1)
         base_mat = obs[:, 8:].view(-1, 12, 7)
-        pokemon_vec, move_pp, status = self.unpack_pokemon_rows(base_mat)
+        # Unpack compressed tensors
+        pokemon_vec, move_pp, status_vec = self.unpack_pokemon_rows(base_mat)
         
         # Concatenate all features: header + pokemon data
         # active_features: [batch, 18] (choices + p1/p2 stats)
         # pokemon_vec: [batch, 12, 5] -> [batch, 60]
         # move_pp: [batch, 12, 4] -> [batch, 48] 
-        # status: [batch, 12]
-        # Total: 18 + 60 + 48 + 12 = 138
+        # status_vec: [batch, 12, 6] -> [batch, 72]
+        # Total: 18 + 60 + 48 + 72 = 198
         output_matrix = torch.cat([
             active_features,
             pokemon_vec.flatten(1),
             move_pp.flatten(1),
-            status
-        ], dim=1)  # [batch, 138]
+            status_vec.flatten(1)
+        ], dim=1)  # [batch, 198]
         
         return output_matrix
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
 
     @staticmethod
     def unpack_stats(high, low):
-        """Unpack 7 stat mods from two packed ints, normalize to approx -1 to 1."""
-        mods = torch.zeros(high.shape[0], 7, device=high.device, dtype=torch.float32)
-        # Assuming high has mods 0-3 (4 bits each), low has 4-6
-        for i in range(4):
-            mods[:, i] = ((high >> (i * 4)) & 0xF).float() - 6.0
-        for i in range(3):
-            mods[:, 3 + i] = ((low >> (i * 4)) & 0xF).float() - 6.0
-        return mods / 6.0  # Normalize to ~ -1 to 1
-
+        """Unpack 7 stat mods from two packed ints into separate normalized tensors (0-12)."""
+        shifts_high = torch.tensor([0, 4, 8, 12], device=high.device)
+        shifts_low = torch.tensor([0, 4, 8], device=low.device)
+        stats_high = ((high >> shifts_high) & 0xF)  # [batch, 4]
+        stats_low = ((low >> shifts_low) & 0xF)  # [batch, 3]
+        stats = -1.0 + torch.cat([stats_high, stats_low], dim=1) / 6.0  
+        return stats # [batch, 7]
+    
     def unpack_pokemon_rows(self, base_mat: torch.Tensor):
-        """Embed species and moves, extract additional features.
-        
-        Args:
-            base_mat: [batch, 12, 7] raw pokemon data
-        
-        Returns:
-            Tuple of:
-            - pokemon_vec: [batch, 12, 5] species + sum(move_embs) + active_flag
-            - move_pp: [batch, 12, 4] normalized PP for each move
-            - status: [batch, 12] normalized status bits
-        """
         # Unpack species and moves
         # Species embedding
         species_ids = torch.abs(base_mat[:, :, 0]).long()
@@ -1163,8 +1151,9 @@ class Showdown(nn.Module):
         
         move_pp = torch.stack(move_pp, dim=2)  # [batch, 12, 4]
         
-        # Status: normalized packed bits
-        ## Might need to split these up into individual status conditions/as elements of an embedding space.
-        status = base_mat[:, :, 6].float() / 65535.0  # [batch, 12]
+        # Status: unpack individual bits (vectorized)
+        status_packed = base_mat[:, :, 6]
+        shifts = torch.tensor([0, 1, 2, 3, 4, 5], device=base_mat.device)
+        status_vec = ((status_packed.unsqueeze(-1) >> shifts) & 1).float()  # [batch, 12, 6]
         
-        return pokemon_vec, move_pp, status
+        return pokemon_vec, move_pp, status_vec
