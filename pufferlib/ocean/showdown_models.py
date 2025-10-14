@@ -25,8 +25,11 @@ class LSTMWrapper(nn.Module):
         Requires that your policy define encode_observations and decode_actions.
         See the Default policy for an example.'''
         super().__init__()
-        self.obs_shape = env.single_observation_space.shape
-
+        if env:
+            self.obs_shape = env.single_observation_space.shape
+        else:
+            ##Todo: Revert when env is real.
+            self.obs_shape = (206,)  # Default to Showdown obs shape (choices removed)
         self.policy = policy
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -122,32 +125,43 @@ class LSTMWrapper(nn.Module):
 
 
 class ShowdownLSTM(LSTMWrapper):
-    def __init__(self, env, policy, input_size = 256, hidden_size = 256):
+    def __init__(self, env, policy, input_size = 256, hidden_size = 256, depth=12):
         # policy = Showdown(env, hidden_size=hidden_size, depth=depth)
         super().__init__(env, policy, input_size, hidden_size)
-
 
 class Showdown(nn.Module):
     MAX_MOVE = 165.0
     MAX_POKE = 151.0
     def __init__(self, env, hidden_size=256, depth=12):
         super().__init__()
+        self.num_steps = 0
         self.is_continuous = False
 
-        self.embed_size = 4  # Each pokemon row embedding output dim after summation
+        # Packing / shape params (align with showdown_models.Showdown)
+        self.embed_size = 5  # Each pokemon row embedding output dim after summation
         self.rows = 13
-        self.num_pokemon_rows = self.rows - 1  # exclude prev_action row
+        self.num_pokemon_rows = self.rows - 1
+        self.header_size = 4
+        self.pokemon_row_length = 7
 
-        # Per-pokemon feature assembly: embedding(4) + active/pps(5) + gamestate(4) = 13
-        self.per_row_feature_size = self.embed_size + 5 + 4  # =13
-        self.prev_action_size = 9  # raw prev_actions vector length
+        self.stats_per_player = 7
+        self.stats_total = self.stats_per_player * 2
 
-        self.species_embed = nn.Embedding(int(self.MAX_POKE), 4)  # Assume ~1000 species
-        self.move_embed = nn.Embedding(int(self.MAX_MOVE), 4)  # Max move id ~165
+        self.active_flag_len = 1
+        self.move_pp_len = 4
+        self.status_flags = 6
+
+        self.per_pokemon_unpacked = self.embed_size + self.active_flag_len + self.move_pp_len + self.status_flags
+
         self.hidden_size = hidden_size
         self.num_actions = 10
-        
-        self.input_size = 198  # Unpacked feature size
+
+        # Compute input_size consistently from components
+        self.input_size = self.stats_total + (self.num_pokemon_rows * self.per_pokemon_unpacked)
+
+        # +1 because move/pokemon IDs are 1-based or may include the max id (e.g. STRUGGLE)
+        self.species_embed = nn.Embedding(int(self.MAX_POKE) + 1, self.embed_size)
+        self.move_embed = nn.Embedding(int(self.MAX_MOVE) + 1, self.embed_size)
 
         encoder_layers = [nn.Linear(self.input_size, hidden_size), nn.GELU()]
         for i in range(depth):
@@ -159,6 +173,7 @@ class Showdown(nn.Module):
             nn.Linear(hidden_size, self.num_actions), std=0.01
         )
         self.value = layer_init(nn.Linear(hidden_size, 1), std=1)
+
 
     def forward(self, observations, state=None):
         ##print for the very first batch 
@@ -184,36 +199,31 @@ class Showdown(nn.Module):
         return logits, values
 
     def unpack_obs(self, obs: torch.Tensor):
-        # Header: 8 ints - choices (0-3) + stat mods (4-7)
-        header = obs[:, :8]
-        # Choices: p1_choice, p1_val, p2_choice, p2_val (normalized 0-1)
-        p1_choice = obs[:, 0:1] / 2.0
-        p1_val = obs[:, 1:2] / Showdown.MAX_MOVE
-        p2_choice = obs[:, 2:3] / 2.0
-        p2_val = obs[:, 3:4] / Showdown.MAX_MOVE
+        # Header now contains only stat mods for both players (4 ints)
         # Stat mods: unpack and normalize for both players
-        p1_stats = self.unpack_stats(obs[:, 4:5], obs[:, 5:6])  # [batch, 7]
-        p2_stats = self.unpack_stats(obs[:, 6:7], obs[:, 7:8])  # [batch, 7]
-        
-        # Flatten into single vector: choices + p1_stats + p2_stats
-        active_features = torch.cat([p1_choice, p1_val, p2_choice, p2_val, p1_stats, p2_stats], dim=1)
-        base_mat = obs[:, 8:].view(-1, 12, 7)
+        p1_stats = self.unpack_stats(obs[:, 0:1], obs[:, 1:2])  # [batch, 7]
+        p2_stats = self.unpack_stats(obs[:, 2:3], obs[:, 3:4])  # [batch, 7]
+
+        # Flatten into single vector: p1_stats + p2_stats (14 dims)
+        active_features = torch.cat([p1_stats, p2_stats], dim=1)
+        base_mat = obs[:, self.header_size:].view(-1, self.num_pokemon_rows, self.pokemon_row_length)
+
         # Unpack compressed tensors
         pokemon_vec, move_pp, status_vec = self.unpack_pokemon_rows(base_mat)
-        
-        # Concatenate all features: header + pokemon data
-        # active_features: [batch, 18] (choices + p1/p2 stats)
+
+        # Concatenate all features: stats + pokemon data
+        # active_features: [batch, 14] (p1_stats + p2_stats)
         # pokemon_vec: [batch, 12, 5] -> [batch, 60]
-        # move_pp: [batch, 12, 4] -> [batch, 48] 
+        # move_pp: [batch, 12, 4] -> [batch, 48]
         # status_vec: [batch, 12, 6] -> [batch, 72]
-        # Total: 18 + 60 + 48 + 72 = 198
+        # Total: 14 + 60 + 48 + 72 = 194
         output_matrix = torch.cat([
             active_features,
             pokemon_vec.flatten(1),
             move_pp.flatten(1),
             status_vec.flatten(1)
-        ], dim=1)  # [batch, 198]
-        
+        ], dim=1)  # [batch, 194]
+
         return output_matrix
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
 
@@ -231,7 +241,11 @@ class Showdown(nn.Module):
         # Unpack species and moves
         # Species embedding
         species_ids = torch.abs(base_mat[:, :, 0]).long()
-        species_emb = self.species_embed(species_ids)  # [batch, 12, 4]
+        # Map species ids into embedding range using modulo (simpler and avoids
+        # overflow). This keeps values valid for embedding lookup while not
+        # mutating the original packing logic.
+        max_species = self.species_embed.num_embeddings
+        species_emb = self.species_embed(species_ids % max_species)  # [batch, 12, 4]
         
         # Move embeddings and PP
         move_embs = []
@@ -239,7 +253,9 @@ class Showdown(nn.Module):
         for k in range(4):
             move_packed = base_mat[:, :, 1 + k]
             move_ids = (move_packed & 0xFF).long()
-            move_emb = self.move_embed(move_ids)  # [batch, 12, 4]
+            # Map move ids into embedding range using modulo to prevent overflow
+            max_move = self.move_embed.num_embeddings
+            move_emb = self.move_embed(move_ids % max_move)  # [batch, 12, 4]
             move_embs.append(move_emb)
             
             pp = ((move_packed >> 8) & 0x1F).float() / 31.0  # PP 0-31 -> 0-1
