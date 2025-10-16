@@ -82,12 +82,12 @@ if DEBUG:
     extra_compile_args += [
         '-O0',
         '-g',
-        # '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
+        '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
         '-fno-omit-frame-pointer',
     ]
     extra_link_args += [
         '-g',
-        # '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
+        '-fsanitize=address,undefined,bounds,pointer-overflow,leak',
     ]
     cxx_args += [
         '-O0',

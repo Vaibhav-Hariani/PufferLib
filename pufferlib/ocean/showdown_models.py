@@ -125,14 +125,15 @@ class LSTMWrapper(nn.Module):
 
 
 class ShowdownLSTM(LSTMWrapper):
-    def __init__(self, env, policy, input_size = 256, hidden_size = 256, depth=12):
+    def __init__(self, env, policy, input_size = 256, hidden_size = 256):
         # policy = Showdown(env, hidden_size=hidden_size, depth=depth)
         super().__init__(env, policy, input_size, hidden_size)
 
 class Showdown(nn.Module):
     MAX_MOVE = 165.0
     MAX_POKE = 151.0
-    def __init__(self, env, hidden_size=256, depth=12):
+    
+    def __init__(self, env, input_size=1024, hidden_size=256, depth=2):
         super().__init__()
         self.num_steps = 0
         self.is_continuous = False
@@ -151,7 +152,11 @@ class Showdown(nn.Module):
         self.move_pp_len = 4
         self.status_flags = 6
 
-        self.per_pokemon_unpacked = self.embed_size + self.active_flag_len + self.move_pp_len + self.status_flags
+        # Each pokemon is now represented by concatenation of
+        # species_emb (5) + 4 move embeddings (4*5=20) + active_flag (1) = 26 dims.
+        # We keep move_pp (4) and status flags (6) separate.
+        # Per-pokemon unpacked dims = 26 + 4 + 6 = 36
+        self.per_pokemon_unpacked = (self.embed_size) * 5 + 1 + self.move_pp_len + self.status_flags
 
         self.hidden_size = hidden_size
         self.num_actions = 10
@@ -163,16 +168,22 @@ class Showdown(nn.Module):
         self.species_embed = nn.Embedding(int(self.MAX_POKE) + 1, self.embed_size)
         self.move_embed = nn.Embedding(int(self.MAX_MOVE) + 1, self.embed_size)
 
-        encoder_layers = [nn.Linear(self.input_size, hidden_size), nn.GELU()]
+        # We no longer project concatenated species+moves down to embed_size.
+        # Instead, pokemon_vec will be the raw concatenation of species_emb (5)
+        # and the 4 move embeddings (4*5=20) -> 25 dims.
+
+        # First encoder layer: plain projection + GELU (don't use layer_init here
+        # so concat_in flows directly through the encoder projection and nonlinearity)
+        encoder_layers = [nn.Linear(self.input_size, self.hidden_size), nn.GELU()]
         for i in range(depth):
-            encoder_layers.append(nn.Linear(hidden_size, hidden_size))
+            encoder_layers.append(layer_init(nn.Linear(self.hidden_size, self.hidden_size), std=1.0))
             encoder_layers.append(nn.GELU())
 
         self.encoder = nn.Sequential(*encoder_layers)
         self.decoder = layer_init(
-            nn.Linear(hidden_size, self.num_actions), std=0.01
+            nn.Linear(self.hidden_size, self.num_actions), std=0.01
         )
-        self.value = layer_init(nn.Linear(hidden_size, 1), std=1)
+        self.value = layer_init(nn.Linear(self.hidden_size, 1), std=1)
 
 
     def forward(self, observations, state=None):
@@ -211,18 +222,18 @@ class Showdown(nn.Module):
         # Unpack compressed tensors
         pokemon_vec, move_pp, status_vec = self.unpack_pokemon_rows(base_mat)
 
-        # Concatenate all features: stats + pokemon data
-        # active_features: [batch, 14] (p1_stats + p2_stats)
-        # pokemon_vec: [batch, 12, 5] -> [batch, 60]
-        # move_pp: [batch, 12, 4] -> [batch, 48]
-        # status_vec: [batch, 12, 6] -> [batch, 72]
-        # Total: 14 + 60 + 48 + 72 = 194
+    # Concatenate all features: stats + pokemon data
+    # active_features: [batch, 14] (p1_stats + p2_stats)
+    # pokemon_vec: [batch, 12, 26] -> [batch, 312]
+    # move_pp: [batch, 12, 4] -> [batch, 48]
+    # status_vec: [batch, 12, 6] -> [batch, 72]
+    # Total: 14 + 312 + 48 + 72 = 446
         output_matrix = torch.cat([
             active_features,
             pokemon_vec.flatten(1),
             move_pp.flatten(1),
             status_vec.flatten(1)
-        ], dim=1)  # [batch, 194]
+    ], dim=1)  # [batch, 434]
 
         return output_matrix
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
@@ -255,20 +266,18 @@ class Showdown(nn.Module):
             move_ids = (move_packed & 0xFF).long()
             # Map move ids into embedding range using modulo to prevent overflow
             max_move = self.move_embed.num_embeddings
-            move_emb = self.move_embed(move_ids % max_move)  # [batch, 12, 4]
+            move_emb = self.move_embed(move_ids % max_move)  # [batch, 12, embed_size]
             move_embs.append(move_emb)
-            
+
             pp = ((move_packed >> 8) & 0x1F).float() / 31.0  # PP 0-31 -> 0-1
             move_pp.append(pp)
-        
-        move_sum = sum(move_embs)  # [batch, 12, 4]
-        
+
         # Active flags: species < 0 indicates active
         active_flags = (base_mat[:, :, 0] < 0).float()  # [batch, 12]
-        
-        # Concatenate embeddings with active flag
-        pokemon_vec = torch.cat([species_emb + move_sum, active_flags.unsqueeze(-1)], dim=-1)  # [batch, 12, 5]
-        
+
+
+        #Batch, [12, 26]
+        pokemon_vec = torch.cat([species_emb, active_flags.unsqueeze(-1)] + move_embs, dim=-1)  # [batch, 12, 26]
         move_pp = torch.stack(move_pp, dim=2)  # [batch, 12, 4]
         
         # Status: unpack individual bits (vectorized)
