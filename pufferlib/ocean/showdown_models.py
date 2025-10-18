@@ -128,6 +128,78 @@ class ShowdownLSTM(LSTMWrapper):
     def __init__(self, env, policy, input_size = 256, hidden_size = 256):
         # policy = Showdown(env, hidden_size=hidden_size, depth=depth)
         super().__init__(env, policy, input_size, hidden_size)
+        
+        # Initialize LSTM state for eval
+        self._eval_state = None
+        self._device = None
+        
+    def init_eval_state(self, device='cuda', batch_size=1):
+        """Initialize LSTM state for evaluation/inference.
+        
+        Args:
+            device: Device to create tensors on ('cpu' or 'cuda')
+            batch_size: Number of parallel environments (typically 1 for eval)
+        """
+        self.device = device
+        self._eval_state = {
+            'lstm_h': torch.zeros(batch_size, self.hidden_size, device=device),
+            'lstm_c': torch.zeros(batch_size, self.hidden_size, device=device),
+            'hidden': None,
+        }
+        return self._eval_state
+    
+    def reset_eval_state(self):
+        """Reset LSTM state to zeros (e.g., at start of new episode)."""
+        if self._eval_state is not None:
+            self._eval_state['lstm_h'].zero_()
+            self._eval_state['lstm_c'].zero_()
+            self._eval_state['hidden'] = None
+
+    def get_action(self, observation, state=None, deterministic=True):
+        """Get action from observation during evaluation.
+
+        Args:
+            observation: numpy array or torch tensor of shape (obs_size,) or (1, obs_size)
+            state: Optional LSTM state dict. If None, uses internal _eval_state
+            deterministic: If True, returns argmax action. If False, samples from distribution.
+            
+        Returns:
+            action: int action index
+            state: updated LSTM state dict
+        """
+        # Use internal state if none provided
+        if state is None:
+            if self._eval_state is None:
+                # Auto-initialize with default device
+                self.init_eval_state(device=self.device)
+            state = self._eval_state
+        
+        # Convert observation to tensor if needed
+        if not isinstance(observation, torch.Tensor):
+            observation = torch.from_numpy(observation)
+        
+        # Ensure correct device
+        observation = observation.to(self.device)
+        
+        # Add batch dimension if needed
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0)
+        
+        # Get logits and value from model
+        with torch.no_grad():
+            logits, value = self.forward_eval(observation, state)
+            
+            if deterministic:
+                # Take argmax action
+                action = torch.argmax(logits, dim=-1)
+            else:
+                # Sample from distribution
+                probs = torch.softmax(logits, dim=-1)
+                action = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        
+        # Return scalar action and updated state
+        action_int = int(action.cpu().item())
+        return action_int, state
 
 class Showdown(nn.Module):
     MAX_MOVE = 165.0
