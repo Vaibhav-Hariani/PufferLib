@@ -3,20 +3,28 @@ from typing import Tuple
 import torch
 from torch import nn
 
-# Local replacements for pufferlib utilities so this file is self-contained.
-def layer_init(layer: nn.Module, std: float = 1.0, bias_const: float = 0.0) -> nn.Module:
-    """Initialize linear layer weights and biases.
+##If these break, restore to pufferless-models for deployment
+from pufferlib.pytorch import layer_init
+# from pufferlib.models import LSTMWrapper
 
-    - weights: orthogonal initialized with given gain (std)
-    - bias: constant bias_const
-    Returns the layer for convenience.
-    """
-    if hasattr(layer, "weight") and layer.weight is not None:
-        nn.init.orthogonal_(layer.weight, gain=std)
-    if hasattr(layer, "bias") and layer.bias is not None:
-        nn.init.constant_(layer.bias, bias_const)
-    return layer
 
+def apply_sinusoidal(x: torch.Tensor) -> torch.Tensor:
+    _, s, d = x.shape
+
+    positions = torch.arange(s, device=x.device).unsqueeze(1).float()  # [s,1]
+    idx = torch.arange(d, device=x.device)
+    pair_idx = idx - (idx % 2)
+    div = torch.pow(10000.0, - (pair_idx.float() / d))  # [d]
+
+    angle = positions * div.unsqueeze(0)  # [s, d]
+
+    pe = torch.empty(s, d, device=x.device)
+    pe[:, 0::2] = torch.sin(angle[:, 0::2])
+    pe[:, 1::2] = torch.cos(angle[:, 1::2])
+
+    out = x + pe
+
+    return out
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, input_size=128, hidden_size=128):
@@ -134,12 +142,6 @@ class ShowdownLSTM(LSTMWrapper):
         self._device = None
         
     def init_eval_state(self, device='cuda', batch_size=1):
-        """Initialize LSTM state for evaluation/inference.
-        
-        Args:
-            device: Device to create tensors on ('cpu' or 'cuda')
-            batch_size: Number of parallel environments (typically 1 for eval)
-        """
         self.device = device
         self._eval_state = {
             'lstm_h': torch.zeros(batch_size, self.hidden_size, device=device),
@@ -154,38 +156,24 @@ class ShowdownLSTM(LSTMWrapper):
             self._eval_state['lstm_h'].zero_()
             self._eval_state['lstm_c'].zero_()
             self._eval_state['hidden'] = None
-
+    
+    ## Ripped out of Puffer
     def get_action(self, observation, state=None, deterministic=True):
-        """Get action from observation during evaluation.
-
-        Args:
-            observation: numpy array or torch tensor of shape (obs_size,) or (1, obs_size)
-            state: Optional LSTM state dict. If None, uses internal _eval_state
-            deterministic: If True, returns argmax action. If False, samples from distribution.
-            
-        Returns:
-            action: int action index
-            state: updated LSTM state dict
-        """
-        # Use internal state if none provided
         if state is None:
             if self._eval_state is None:
-                # Auto-initialize with default device
                 self.init_eval_state(device=self.device)
             state = self._eval_state
         
         # Convert observation to tensor if needed
         if not isinstance(observation, torch.Tensor):
             observation = torch.from_numpy(observation)
-        
-        # Ensure correct device
+
         observation = observation.to(self.device)
-        
+
         # Add batch dimension if needed
         if observation.dim() == 1:
             observation = observation.unsqueeze(0)
-        
-        # Get logits and value from model
+                
         with torch.no_grad():
             logits, value = self.forward_eval(observation, state)
             
@@ -205,52 +193,37 @@ class Showdown(nn.Module):
     MAX_MOVE = 165.0
     MAX_POKE = 151.0
     
-    def __init__(self, env, input_size=1024, hidden_size=256, depth=2):
+    def __init__(self, env, input_size=256, hidden_size=256):
         super().__init__()
         self.num_steps = 0
         self.is_continuous = False
 
         # Packing / shape params (align with showdown_models.Showdown)
         self.embed_size = 5  # Each pokemon row embedding output dim after summation
-        self.rows = 13
-        self.num_pokemon_rows = self.rows - 1
+        poke_per_team = 6
+        self.num_pokemon_rows = poke_per_team * 2
         self.header_size = 4
         self.pokemon_row_length = 7
 
-        self.stats_per_player = 7
-        self.stats_total = self.stats_per_player * 2
+        stats_per_player = 7
+        stats_total = stats_per_player * 2
 
-        self.active_flag_len = 1
-        self.move_pp_len = 4
-        self.status_flags = 6
+        active_flag_len = 1
+        hp_len = 1
+        move_pp_len = 4
+        status_flags = 6
 
-        # Each pokemon is now represented by concatenation of
-        # species_emb (5) + 4 move embeddings (4*5=20) + active_flag (1) = 26 dims.
-        # We keep move_pp (4) and status flags (6) separate.
-        # Per-pokemon unpacked dims = 26 + 4 + 6 = 36
-        self.per_pokemon_unpacked = (self.embed_size) * 5 + 1 + self.move_pp_len + self.status_flags
+        self.per_pokemon_unpacked = (self.embed_size) * 5 + active_flag_len + hp_len + move_pp_len + status_flags
 
         self.hidden_size = hidden_size
         self.num_actions = 10
 
-        # Compute input_size consistently from components
-        self.input_size = self.stats_total + (self.num_pokemon_rows * self.per_pokemon_unpacked)
+        self.input_size = stats_total + (self.num_pokemon_rows * self.per_pokemon_unpacked)
 
-        # +1 because move/pokemon IDs are 1-based or may include the max id (e.g. STRUGGLE)
         self.species_embed = nn.Embedding(int(self.MAX_POKE) + 1, self.embed_size)
         self.move_embed = nn.Embedding(int(self.MAX_MOVE) + 1, self.embed_size)
 
-        # We no longer project concatenated species+moves down to embed_size.
-        # Instead, pokemon_vec will be the raw concatenation of species_emb (5)
-        # and the 4 move embeddings (4*5=20) -> 25 dims.
-
-        # First encoder layer: plain projection + GELU (don't use layer_init here
-        # so concat_in flows directly through the encoder projection and nonlinearity)
         encoder_layers = [nn.Linear(self.input_size, self.hidden_size), nn.GELU()]
-        for i in range(depth):
-            encoder_layers.append(layer_init(nn.Linear(self.hidden_size, self.hidden_size), std=1.0))
-            encoder_layers.append(nn.GELU())
-
         self.encoder = nn.Sequential(*encoder_layers)
         self.decoder = layer_init(
             nn.Linear(self.hidden_size, self.num_actions), std=0.01
@@ -282,79 +255,70 @@ class Showdown(nn.Module):
         return logits, values
 
     def unpack_obs(self, obs: torch.Tensor):
-        # Header now contains only stat mods for both players (4 ints)
-        # Stat mods: unpack and normalize for both players
         p1_stats = self.unpack_stats(obs[:, 0:1], obs[:, 1:2])  # [batch, 7]
         p2_stats = self.unpack_stats(obs[:, 2:3], obs[:, 3:4])  # [batch, 7]
 
-        # Flatten into single vector: p1_stats + p2_stats (14 dims)
         active_features = torch.cat([p1_stats, p2_stats], dim=1)
         base_mat = obs[:, self.header_size:].view(-1, self.num_pokemon_rows, self.pokemon_row_length)
 
-        # Unpack compressed tensors
         pokemon_vec, move_pp, status_vec = self.unpack_pokemon_rows(base_mat)
 
-    # Concatenate all features: stats + pokemon data
-    # active_features: [batch, 14] (p1_stats + p2_stats)
-    # pokemon_vec: [batch, 12, 26] -> [batch, 312]
-    # move_pp: [batch, 12, 4] -> [batch, 48]
-    # status_vec: [batch, 12, 6] -> [batch, 72]
-    # Total: 14 + 312 + 48 + 72 = 446
         output_matrix = torch.cat([
             active_features,
             pokemon_vec.flatten(1),
             move_pp.flatten(1),
             status_vec.flatten(1)
-    ], dim=1)  # [batch, 434]
+    ], dim=1) # [batch, input_size]
 
         return output_matrix
     # Embedding pokemon IDs and moves, sum per pokemon, combine with gamestate
 
     @staticmethod
     def unpack_stats(high, low):
-        """Unpack 7 stat mods from two packed ints into separate normalized tensors (0-12)."""
+
         shifts_high = torch.tensor([0, 4, 8, 12], device=high.device)
         shifts_low = torch.tensor([0, 4, 8], device=low.device)
+
         stats_high = ((high >> shifts_high) & 0xF)  # [batch, 4]
         stats_low = ((low >> shifts_low) & 0xF)  # [batch, 3]
         stats = -1.0 + torch.cat([stats_high, stats_low], dim=1) / 6.0  
         return stats # [batch, 7]
     
     def unpack_pokemon_rows(self, base_mat: torch.Tensor):
-        # Unpack species and moves
-        # Species embedding
+        # Species ids (abs because active flagged species are negative)
         species_ids = torch.abs(base_mat[:, :, 0]).long()
-        # Map species ids into embedding range using modulo (simpler and avoids
-        # overflow). This keeps values valid for embedding lookup while not
-        # mutating the original packing logic.
-        max_species = self.species_embed.num_embeddings
-        species_emb = self.species_embed(species_ids % max_species)  # [batch, 12, 4]
-        
-        # Move embeddings and PP
+        max_species = int(Showdown.MAX_POKE)
+        species_emb = self.species_embed(species_ids % max_species)  # [batch, slots, embed_size]
+
+
+        hp_packed = base_mat[:, :, 5].float()
+        hp_norm = (hp_packed / 1000.0).unsqueeze(-1)  # [batch, slots, 1]
+
+
         move_embs = []
         move_pp = []
+        max_move = int(Showdown.MAX_MOVE)
         for k in range(4):
             move_packed = base_mat[:, :, 1 + k]
             move_ids = (move_packed & 0xFF).long()
-            # Map move ids into embedding range using modulo to prevent overflow
-            max_move = self.move_embed.num_embeddings
-            move_emb = self.move_embed(move_ids % max_move)  # [batch, 12, embed_size]
+
+            move_emb = self.move_embed(move_ids % max_move)  # [batch, slots, embed_size]
             move_embs.append(move_emb)
 
             pp = ((move_packed >> 8) & 0x1F).float() / 31.0  # PP 0-31 -> 0-1
             move_pp.append(pp)
 
-        # Active flags: species < 0 indicates active
-        active_flags = (base_mat[:, :, 0] < 0).float()  # [batch, 12]
+        active_flags = (base_mat[:, :, 0] < 0).float()  # [batch, slots]
 
+        species_emb = apply_sinusoidal(species_emb)
+        move_embs = [apply_sinusoidal(m) for m in move_embs]
 
-        #Batch, [12, 26]
-        pokemon_vec = torch.cat([species_emb, active_flags.unsqueeze(-1)] + move_embs, dim=-1)  # [batch, 12, 26]
-        move_pp = torch.stack(move_pp, dim=2)  # [batch, 12, 4]
-        
-        # Status: unpack individual bits (vectorized)
+        pokemon_vec = torch.cat([species_emb, active_flags.unsqueeze(-1), hp_norm] + move_embs, dim=-1)
+
+        move_pp = torch.stack(move_pp, dim=2)  # [batch, slots, 4]
+
         status_packed = base_mat[:, :, 6]
         shifts = torch.tensor([0, 1, 2, 3, 4, 5], device=base_mat.device)
-        status_vec = ((status_packed.unsqueeze(-1) >> shifts) & 1).float()  # [batch, 12, 6]
-        
+        status_vec = ((status_packed.unsqueeze(-1) >> shifts) & 1).float()  # [batch, slots, 6]
+
         return pokemon_vec, move_pp, status_vec
