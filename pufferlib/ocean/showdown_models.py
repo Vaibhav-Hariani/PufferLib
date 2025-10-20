@@ -8,23 +8,23 @@ from pufferlib.pytorch import layer_init
 # from pufferlib.models import LSTMWrapper
 
 
-def apply_sinusoidal(x: torch.Tensor) -> torch.Tensor:
-    _, s, d = x.shape
+# def apply_sinusoidal(x: torch.Tensor) -> torch.Tensor:
+#     _, s, d = x.shape
 
-    positions = torch.arange(s, device=x.device).unsqueeze(1).float()  # [s,1]
-    idx = torch.arange(d, device=x.device)
-    pair_idx = idx - (idx % 2)
-    div = torch.pow(10000.0, - (pair_idx.float() / d))  # [d]
+#     positions = torch.arange(s, device=x.device).unsqueeze(1).float()  # [s,1]
+#     idx = torch.arange(d, device=x.device)
+#     pair_idx = idx - (idx % 2)
+#     div = torch.pow(10000.0, - (pair_idx.float() / d))  # [d]
 
-    angle = positions * div.unsqueeze(0)  # [s, d]
+#     angle = positions * div.unsqueeze(0)  # [s, d]
 
-    pe = torch.empty(s, d, device=x.device)
-    pe[:, 0::2] = torch.sin(angle[:, 0::2])
-    pe[:, 1::2] = torch.cos(angle[:, 1::2])
+#     pe = torch.empty(s, d, device=x.device)
+#     pe[:, 0::2] = torch.sin(angle[:, 0::2])
+#     pe[:, 1::2] = torch.cos(angle[:, 1::2])
 
-    out = x + pe
+#     out = x + pe
 
-    return out
+#     return out
 
 class LSTMWrapper(nn.Module):
     def __init__(self, env, policy, input_size=128, hidden_size=128):
@@ -193,7 +193,7 @@ class Showdown(nn.Module):
     MAX_MOVE = 165.0
     MAX_POKE = 151.0
     
-    def __init__(self, env, input_size=256, hidden_size=256):
+    def __init__(self, env, input_size=256, hidden_size=256, depth=2):
         super().__init__()
         self.num_steps = 0
         self.is_continuous = False
@@ -209,7 +209,7 @@ class Showdown(nn.Module):
         stats_total = stats_per_player * 2
 
         active_flag_len = 1
-        hp_len = 1
+        hp_len = 0
         move_pp_len = 4
         status_flags = 6
 
@@ -224,6 +224,9 @@ class Showdown(nn.Module):
         self.move_embed = nn.Embedding(int(self.MAX_MOVE) + 1, self.embed_size)
 
         encoder_layers = [nn.Linear(self.input_size, self.hidden_size), nn.GELU()]
+        for i in range(depth):
+            encoder_layers.append(nn.Linear(self.hidden_size, self.hidden_size))
+            encoder_layers.append(nn.GELU())
         self.encoder = nn.Sequential(*encoder_layers)
         self.decoder = layer_init(
             nn.Linear(self.hidden_size, self.num_actions), std=0.01
@@ -291,8 +294,8 @@ class Showdown(nn.Module):
         species_emb = self.species_embed(species_ids % max_species)  # [batch, slots, embed_size]
 
 
-        hp_packed = base_mat[:, :, 5].float()
-        hp_norm = (hp_packed / 1000.0).unsqueeze(-1)  # [batch, slots, 1]
+        # hp_packed = base_mat[:, :, 5].float()
+        # hp_norm = (hp_packed / 1000.0).unsqueeze(-1)  # [batch, slots, 1]
 
 
         move_embs = []
@@ -310,10 +313,10 @@ class Showdown(nn.Module):
 
         active_flags = (base_mat[:, :, 0] < 0).float()  # [batch, slots]
 
-        species_emb = apply_sinusoidal(species_emb)
-        move_embs = [apply_sinusoidal(m) for m in move_embs]
+        # species_emb = apply_sinusoidal(species_emb)
+        # move_embs = [apply_sinusoidal(m) for m in move_embs]
 
-        pokemon_vec = torch.cat([species_emb, active_flags.unsqueeze(-1), hp_norm] + move_embs, dim=-1)
+        pokemon_vec = torch.cat([species_emb, active_flags.unsqueeze(-1)] + move_embs, dim=-1)
 
         move_pp = torch.stack(move_pp, dim=2)  # [batch, slots, 4]
 
