@@ -193,11 +193,12 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if args['wandb']:
         import wandb
         run_id = wandb.util.generate_id()
-        wandb.init(id=run_id, config=args,
+        wandb.init(config=args,
             project=args['wandb_project'], group=args['wandb_group'],
             tags=[args['tag']] if args['tag'] is not None else [],
             settings=wandb.Settings(console="off"),
         )
+        run_id = wandb.run.id
 
     target_key = f'env/{args["sweep"]["metric"]}'
     total_timesteps = args['train']['total_timesteps']
@@ -211,8 +212,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     try:
         pufferl = backend.create_pufferl(args)
-    except RuntimeError as e:
-        print(f'WARNING: {e}, skipping')
+    except Exception as e:
+        # Broad except is intentional: a bad Protein-suggested hyperparameter combo
+        # (e.g. a non-integer num_layers, or any other misconfiguration) must not
+        # leave the sweep's result_queue.get() in the parent process blocked forever.
+        print(f'WARNING: {type(e).__name__}: {e}, skipping')
         if result_queue is not None:
             result_queue.put((args['gpu_id'], [], [], []))
         return
@@ -223,94 +227,105 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
-    model_path = ''
-    flat_logs = {}
-    train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
-    eval_epochs = train_epochs // 2
-    for epoch in range(train_epochs + eval_epochs):
-        backend.rollouts(pufferl)
+    # Broad except below is intentional, same reasoning as the create_pufferl try/except
+    # above: a mid-training crash (OOM, NaN, a bad hyperparameter combo surfacing only
+    # once training actually runs, etc.) must not leave the sweep's result_queue.get()
+    # in the parent process blocked forever - report failure and let the sweep continue.
+    try:
+        model_path = ''
+        flat_logs = {}
+        train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
+        eval_epochs = train_epochs // 2
+        for epoch in range(train_epochs + eval_epochs):
+            backend.rollouts(pufferl)
 
-        if epoch < train_epochs:
-            backend.train(pufferl)
+            if epoch < train_epochs:
+                backend.train(pufferl)
 
-        if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
-            model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
-            backend.save_weights(pufferl, model_path)
+            if (epoch % args['checkpoint_interval'] == 0 or epoch == train_epochs - 1) and sweep_obj is None:
+                model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+                backend.save_weights(pufferl, model_path)
 
-        # Rate limit, but always log for eval to maintain determinism
-        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
-            continue
+            # Rate limit, but always log for eval to maintain determinism
+            if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
+                continue
 
-        logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+            logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
+            flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
 
-        if verbose:
-            print_dashboard(args, model_size, flat_logs)
+            if verbose:
+                print_dashboard(args, model_size, flat_logs)
+
+            if target_key not in flat_logs:
+                continue
+
+            if args['wandb']:
+                wandb.log(flat_logs, step=flat_logs['agent_steps'])
+
+            if epoch < train_epochs:
+                all_logs.append(flat_logs)
+
+                if (sweep_obj is not None
+                        and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
+                        sweep_obj.early_stop(logs, target_key)):
+                    break
+            elif flat_logs['env/n'] > args['eval_episodes']:
+                break
+
+
+        print_dashboard(args, model_size, flat_logs)
+        backend.close(pufferl)
 
         if target_key not in flat_logs:
-            continue
+            if result_queue is not None:
+                result_queue.put((args['gpu_id'], None, None, None))
+            return
+
+        # This version has the training perf logs and eval env logs
+        all_logs.append(flat_logs)
+
+        # Downsample results
+        n = args['sweep']['downsample']
+        metrics = {k: [[]] for k in all_logs[0]}
+        logged_timesteps = all_logs[-1]['agent_steps']
+        next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
+        for log in all_logs:
+            for k, v in log.items():
+                metrics[k][-1].append(v)
+
+            if log['agent_steps'] < next_bin:
+                continue
+
+            next_bin += logged_timesteps / (n - 1)
+            for k in metrics:
+                metrics[k][-1] = np.mean(metrics[k][-1])
+                metrics[k].append([])
+
+        for k in metrics:
+            metrics[k][-1] = all_logs[-1][k]
+
+        # Save own log: config + downsampled results
+        log_dir = os.path.join(args['log_dir'], args['env_name'])
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
+            json.dump({**args, 'metrics': metrics}, f)
 
         if args['wandb']:
-            wandb.log(flat_logs, step=flat_logs['agent_steps'])
+            if sweep_obj is None and model_path: # Don't spam uploads during sweeps
+                artifact = wandb.Artifact(run_id, type='model')
+                artifact.add_file(model_path)
+                wandb.run.log_artifact(artifact)
 
-        if epoch < train_epochs:
-            all_logs.append(flat_logs)
+            wandb.run.finish()
 
-            if (sweep_obj is not None
-                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
-                    sweep_obj.early_stop(logs, target_key)):
-                break
-        elif flat_logs['env/n'] > args['eval_episodes']:
-            break
-
-
-    print_dashboard(args, model_size, flat_logs)
-    backend.close(pufferl)
-
-    if target_key not in flat_logs:
         if result_queue is not None:
-            result_queue.put((args['gpu_id'], None, None, None))
-        return
-
-    # This version has the training perf logs and eval env logs
-    all_logs.append(flat_logs)
-
-    # Downsample results
-    n = args['sweep']['downsample']
-    metrics = {k: [[]] for k in all_logs[0]}
-    logged_timesteps = all_logs[-1]['agent_steps']
-    next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
-    for log in all_logs:
-        for k, v in log.items():
-            metrics[k][-1].append(v)
-
-        if log['agent_steps'] < next_bin:
-            continue
-
-        next_bin += logged_timesteps / (n - 1)
-        for k in metrics:
-            metrics[k][-1] = np.mean(metrics[k][-1])
-            metrics[k].append([])
-
-    for k in metrics:
-        metrics[k][-1] = all_logs[-1][k]
-
-    # Save own log: config + downsampled results
-    log_dir = os.path.join(args['log_dir'], args['env_name'])
-    os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
-        json.dump({**args, 'metrics': metrics}, f)
-
-    if args['wandb']:
-        if sweep_obj is None and model_path: # Don't spam uploads during sweeps
-            artifact = wandb.Artifact(run_id, type='model')
-            artifact.add_file(model_path)
-            wandb.run.log_artifact(artifact)
-
-        wandb.run.finish()
-
-    if result_queue is not None:
-        result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+            result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+    except Exception as e:
+        print(f'WARNING: {type(e).__name__}: {e}, skipping')
+        if args['wandb']:
+            wandb.run.finish(exit_code=1)
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], [], [], []))
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
@@ -383,7 +398,7 @@ def sweep(env_name, args=None, pareto=False):
         # TODO: only 1 per sweep etc
         gpu_id = next(i for i in range(sweep_gpus) if i not in active)
         timestep_total = all_timesteps[gpu_id] if pareto else None
-        if idx > 1: # First experiment uses defaults
+        if idx > 0: # First experiment uses config defaults as baseline
             sweep_obj.suggest(args, fixed_total_timesteps=timestep_total)
 
         try:
@@ -470,11 +485,15 @@ def load_config(env_name):
 
             #TODO: Can clean up with default sections in 3.13+
             fmt = f'--{key}' if section == 'base' else f'--{section}.{key}'
+            arg_key = fmt.replace('_', '-')
             dtype = type(value)
-            parser.add_argument(
-                fmt.replace('_', '-'), default=value,
-                type=lambda v, t=dtype: v if v == 'auto' else t(v),
-            )
+            if arg_key in parser._option_string_actions:
+                parser._option_string_actions[arg_key].default = value
+            else:
+                parser.add_argument(
+                    arg_key, default=value,
+                    type=lambda v, t=dtype: v if v == 'auto' else t(v),
+                )
 
     parser.add_argument('-h', '--help', default=argparse.SUPPRESS,
         action='help', help='Show this help message and exit')

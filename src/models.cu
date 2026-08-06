@@ -753,12 +753,40 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     return grad;
 }
 
+// Env-specific hard action masking. Some envs (e.g. showdown) pack a legal-action
+// mask into the trailing `act_n` columns of their observation (1.0 = legal, see
+// PACK_MASK_FLOATS in ocean/showdown/sim_utils/sim_packing.h, which must stay in
+// sync with this convention). We additively bias illegal-action logits to a large
+// negative value before sampling/loss so illegal actions get ~zero probability.
+// This is purely additive (not a function of trainable weights), so the backward
+// pass needs no changes: d(masked_logit)/d(raw_logit) == 1 either way.
+__global__ void apply_action_mask_kernel(precision_t* __restrict__ out, const precision_t* __restrict__ obs,
+        int B, int obs_stride, int mask_offset, int act_n, int out_stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * act_n) return;
+    int b = idx / act_n, j = idx % act_n;
+    float m = to_float(obs[(size_t)b * obs_stride + mask_offset + j]);
+    if (m <= 0.5f) {
+        out[(size_t)b * out_stride + j] = from_float(-1e9f);
+    }
+}
+
+static void apply_action_mask(PrecisionTensor& dec_out, PrecisionTensor& obs, int act_n, cudaStream_t stream) {
+    int B = (int)obs.shape[0];
+    int obs_stride = (int)obs.shape[1];
+    int mask_offset = obs_stride - act_n;
+    int out_stride = act_n + 1;  // decoder output is [logits(act_n), value]
+    apply_action_mask_kernel<<<grid_size(B * act_n), BLOCK_SIZE, 0, stream>>>(
+        dec_out.data, obs.data, B, obs_stride, mask_offset, act_n, out_stride);
+}
+
 struct Policy {
     Encoder encoder;
     Decoder decoder;
     Network network;
     int input_dim, hidden_dim, output_dim;
     int num_atns;
+    bool has_action_mask;
 };
 
 struct PolicyActivations {
@@ -783,15 +811,19 @@ PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& a
         PrecisionTensor obs, PrecisionTensor state, cudaStream_t stream) {
     PrecisionTensor enc_out = p->encoder.forward(w.encoder, activations.encoder, obs, stream);
     PrecisionTensor h = p->network.forward(w.network, enc_out, state, activations.network, stream);
-    return p->decoder.forward(w.decoder, activations.decoder, h, stream);
+    PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, h, stream);
+    if (p->has_action_mask) apply_action_mask(dec_out, obs, p->num_atns, stream);
+    return dec_out;
 }
 
 PrecisionTensor policy_forward_train(Policy* p, PolicyWeights& w, PolicyActivations& activations,
         PrecisionTensor x, PrecisionTensor state, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
-    PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *puf_squeeze(&x, 0), stream);
+    PrecisionTensor* obs_flat = puf_squeeze(&x, 0);
+    PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *obs_flat, stream);
     h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, activations.network, stream);
     PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
+    if (p->has_action_mask) apply_action_mask(dec_out, *obs_flat, p->num_atns, stream);
     return *puf_unsqueeze(&dec_out, 0, B, TT);
 }
 

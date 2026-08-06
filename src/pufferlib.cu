@@ -1577,6 +1577,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
         .num_atns = act_n,
+        .has_action_mask = (env_name == "showdown"),
     };
 
     // Create and allocate params

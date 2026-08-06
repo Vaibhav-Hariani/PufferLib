@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from pufferlib.ocean.showdown_models import ShowdownEncoder, ShowdownDecoder
+
 class Policy(nn.Module):
     def __init__(self, encoder, decoder, network):
         super().__init__()
@@ -17,14 +19,15 @@ class Policy(nn.Module):
     def forward_eval(self, x, state):
         h = self.encoder(x)
         h, state = self.network.forward_eval(h, state)
-        logits, values = self.decoder(h)
+        logits, values = self.decoder(h, x)
         return logits, values, state
 
     def forward(self, x):
         B, TT = x.shape[:2]
-        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        x_flat = x.reshape(B*TT, *x.shape[2:])
+        h = self.encoder(x_flat)
         h = self.network.forward_train(h.reshape(B, TT, -1))
-        logits, values = self.decoder(h.reshape(B*TT, -1))
+        logits, values = self.decoder(h.reshape(B*TT, -1), x_flat)
         return logits, values.reshape(B, TT)
 
 class DefaultEncoder(nn.Module):
@@ -50,7 +53,7 @@ class DefaultDecoder(nn.Module):
 
         self.value_function = nn.Linear(hidden_size, 1)
 
-    def forward(self, hidden):
+    def forward(self, hidden, obs=None):
         if self.is_continuous:
             mean = self.decoder_mean(hidden)
             logstd = self.decoder_logstd.expand_as(mean)

@@ -265,6 +265,12 @@ class PuffeRL:
             learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
             self.optimizer.param_groups[0]['lr'] = learning_rate
 
+        ent_coef = config['ent_coef']
+        if config.get('anneal_ent') and self.epoch > 0:
+            ent_ratio = self.epoch / self.total_epochs
+            ent_min = config['ent_coef'] * config['min_ent_ratio']
+            ent_coef = ent_min + 0.5*(ent_coef - ent_min) * (1 + np.cos(np.pi * ent_ratio))
+
         # Transpose from [horizon, agents] (contiguous writes) to [agents, horizon] (minibatch indexing)
         obs = self.observations.transpose(0, 1).contiguous()
         act = self.actions.transpose(0, 1).contiguous()
@@ -327,7 +333,7 @@ class PuffeRL:
             v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
 
             entropy_loss = entropy.mean()
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+            loss = pg_loss + config['vf_coef']*v_loss - ent_coef*entropy_loss
             val[idx] = newvalue.detach().float()
 
             losses['policy_loss'] += pg_loss
