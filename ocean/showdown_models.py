@@ -3,12 +3,16 @@ import torch.nn as nn
 
 
 class ShowdownEncoder(nn.Module):
-    # Obs layout: 14 stat-mod floats + 12 pokemon * 17 floats + 10 mask floats = 228 total
+    # Obs layout: 14 stat-mod floats + 20 volatile-state floats (10 per side:
+    # reflect/light_screen/mist/leech_seed/focus_energy/confused/must_recharge/
+    # trapped_or_charging/rage_locked/substitute_hp_pct - see sim_packing.h) +
+    # 12 pokemon * 17 floats + 10 mask floats = 248 total.
     # Per-pokemon row: [species_id/151, active, move_ids/165 *4, pp*4, hp, status*6]
     # Trailing 10 floats: legal-action mask (6 switch + 4 move), consumed here as an
     # extra input feature (it encodes state not otherwise visible, e.g. lock-in/disable)
     # and separately by ShowdownDecoder for hard logit masking.
     HEADER      = 14
+    VOLATILE    = 20   # 10 floats x 2 players
     NUM_POKE    = 12
     POKE_FLOATS = 17
     MASK_FLOATS = 10
@@ -16,9 +20,9 @@ class ShowdownEncoder(nn.Module):
     MAX_SPECIES = 152   # IDs 0-151
     MAX_MOVE    = 166   # IDs 0-165
 
-    # Concat size: 14 + 12*(species_emb + active + 4*move_emb + 4*pp + hp + 6*status) + 10
-    #            = 14 + 12*(8 + 1 + 32 + 4 + 1 + 6) + 10 = 14 + 12*52 + 10 = 648
-    CONCAT_SIZE = HEADER + NUM_POKE * (EMBED_DIM + 1 + 4 * EMBED_DIM + 4 + 1 + 6) + MASK_FLOATS
+    # Concat size: 14 + 20 + 12*(species_emb + active + 4*move_emb + 4*pp + hp + 6*status) + 10
+    #            = 14 + 20 + 12*(8 + 1 + 32 + 4 + 1 + 6) + 10 = 14 + 20 + 12*52 + 10 = 668
+    CONCAT_SIZE = HEADER + VOLATILE + NUM_POKE * (EMBED_DIM + 1 + 4 * EMBED_DIM + 4 + 1 + 6) + MASK_FLOATS
 
     def __init__(self, obs_size, hidden_size=128):
         super().__init__()
@@ -33,8 +37,10 @@ class ShowdownEncoder(nn.Module):
         B = observations.shape[0]
         obs = observations.float()
         header = obs[:, :self.HEADER]
-        poke_end = self.HEADER + self.NUM_POKE * self.POKE_FLOATS
-        rows = obs[:, self.HEADER:poke_end].view(B, self.NUM_POKE, self.POKE_FLOATS)
+        poke_start = self.HEADER + self.VOLATILE
+        volatile = obs[:, self.HEADER:poke_start]
+        poke_end = poke_start + self.NUM_POKE * self.POKE_FLOATS
+        rows = obs[:, poke_start:poke_end].view(B, self.NUM_POKE, self.POKE_FLOATS)
         mask = obs[:, poke_end:poke_end + self.MASK_FLOATS]
 
         # Scale normalized IDs back to integers for embedding lookup
@@ -50,6 +56,7 @@ class ShowdownEncoder(nn.Module):
 
         x = torch.cat([
             header,
+            volatile,
             species_emb.flatten(1),
             active_flags,
             move_emb.flatten(1),
